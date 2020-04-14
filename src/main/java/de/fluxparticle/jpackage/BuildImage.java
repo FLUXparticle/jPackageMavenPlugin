@@ -1,5 +1,11 @@
 package de.fluxparticle.jpackage;
 
+import com.github.javaparser.StaticJavaParser;
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.expr.Name;
+import com.github.javaparser.ast.modules.ModuleDeclaration;
+import com.github.javaparser.ast.modules.ModuleExportsDirective;
+import com.github.javaparser.ast.modules.ModuleRequiresDirective;
 import org.apache.maven.artifact.DependencyResolutionRequiredException;
 import org.apache.maven.execution.MavenSession;
 import org.apache.maven.plugin.AbstractMojo;
@@ -18,9 +24,12 @@ import org.apache.maven.shared.transfer.artifact.DefaultArtifactCoordinate;
 import org.apache.maven.shared.transfer.artifact.resolve.ArtifactResolver;
 import org.apache.maven.shared.transfer.artifact.resolve.ArtifactResolverException;
 import org.apache.maven.shared.transfer.artifact.resolve.ArtifactResult;
+import org.objectweb.asm.ClassWriter;
+import org.objectweb.asm.ModuleVisitor;
 
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.FileVisitResult;
 import java.nio.file.FileVisitor;
 import java.nio.file.Files;
@@ -40,11 +49,16 @@ import java.util.jar.Manifest;
 import java.util.stream.IntStream;
 import java.util.zip.ZipEntry;
 
+import static com.github.javaparser.ParserConfiguration.LanguageLevel.JAVA_9;
 import static java.lang.String.join;
 import static java.util.function.Function.identity;
 import static java.util.stream.Collectors.joining;
 import static java.util.stream.Collectors.toList;
 import static java.util.stream.Collectors.toMap;
+import static org.objectweb.asm.Opcodes.ACC_MANDATED;
+import static org.objectweb.asm.Opcodes.ACC_MODULE;
+import static org.objectweb.asm.Opcodes.ACC_SYNTHETIC;
+import static org.objectweb.asm.Opcodes.V9;
 
 /**
  * jPackageMavenPlugin - A Maven Plugin to patch all non-modular dependencies and runs jpackage (JDK 14)
@@ -69,13 +83,17 @@ public class BuildImage extends AbstractMojo {
 
     private static final Path JAVA_HOME = Path.of(System.getProperty("java.home"));
 
+    static {
+        StaticJavaParser.getConfiguration().setLanguageLevel(JAVA_9);
+    }
+
     @Component
     private ArtifactResolver artifactResolver;
 
     @Parameter(defaultValue = "${project}", required = true)
     private MavenProject project;
 
-    @Parameter( defaultValue = "${session}", required = true, readonly = true )
+    @Parameter(defaultValue = "${session}", required = true, readonly = true)
     private MavenSession session;
 
     @Parameter(property = "skip", readonly = true)
@@ -204,17 +222,21 @@ public class BuildImage extends AbstractMojo {
             String moduleName = fileName.substring(0, splitVersion).replace('-', '.');
 
             Path mod = modulesDir.resolve(moduleName);
-            Path out = mod.resolve("classes");
+            Path moduleInfo = mod.resolve("module-info.java");
 
-            extract(jar, out);
+            patch(jar, moduleInfo, target);
 
-            Path file = mod.resolve("module-info.java");
+/*
+                Path out = mod.resolve("classes");
 
-            if (!javaCompiler(modulePath, out, file)) {
-                return null;
-            }
+                extract(jar, out);
 
-            pack(target, out);
+                if (!javaCompiler(modulePath, moduleInfo, out)) {
+                    return null;
+                }
+
+                pack(out, target);
+*/
         } finally {
             System.out.println();
         }
@@ -239,7 +261,7 @@ public class BuildImage extends AbstractMojo {
         }
     }
 
-    private static void pack(Path jar, Path out) throws IOException {
+    private static void pack(Path out, Path jar) throws IOException {
         System.out.println("Pack: " + jar);
         try (JarOutputStream target = new JarOutputStream(new FileOutputStream(jar.toString()))) {
             Files.walkFileTree(out, new FileVisitor<>() {
@@ -346,14 +368,14 @@ public class BuildImage extends AbstractMojo {
                         .collect(toMap(
                                 identity(),
                                 idx -> line.get(idx).length()
-                        ))
+                       ))
                         .entrySet().stream()
-                )
+               )
                 .collect(toMap(
                         Entry::getKey,
                         Entry::getValue,
                         Math::max
-                ));
+               ));
 
         for (List<String> line : lines) {
             StringBuilder sb = new StringBuilder();
@@ -388,8 +410,8 @@ public class BuildImage extends AbstractMojo {
         return exec(cmdArray);
     }
 
-    private static boolean javaCompiler(String modulePath, Path out, Path file) throws IOException, InterruptedException {
-        System.out.println("Compile: " + file);
+    private static boolean javaCompiler(String modulePath, Path moduleInfo, Path out) throws IOException, InterruptedException {
+        System.out.println("Compile: " + moduleInfo);
 
         Path javaCompilerBinary = JAVA_HOME.resolve("bin/javac");
 
@@ -397,10 +419,83 @@ public class BuildImage extends AbstractMojo {
                 javaCompilerBinary.toString(),
                 "--module-path", modulePath,
                 "-d", out.toString(),
-                file.toString(),
+                moduleInfo.toString(),
         };
 
         return exec(cmdArray);
+    }
+
+    private static void patch(Path inputJar, Path moduleInfo, Path outputJar) {
+        System.out.println("Compile (In-Memory): " + moduleInfo);
+
+        try {
+            CompilationUnit compilationUnit = StaticJavaParser.parse(moduleInfo);
+
+            ModuleDeclaration module = compilationUnit.getModule().get();
+
+            ClassWriter classWriter = new ClassWriter(0);
+            classWriter.visit(V9, ACC_MODULE, "module-info", null, null, null);
+
+            ModuleVisitor mv = classWriter.visitModule(module.getNameAsString(), ACC_SYNTHETIC, null);
+
+            for (ModuleRequiresDirective requires : module.findAll(ModuleRequiresDirective.class)) {
+                mv.visitRequire(
+                        requires.getName().asString(),
+                        0,
+                        null
+               );
+            }
+
+            for (ModuleExportsDirective export : module.findAll(ModuleExportsDirective.class)) {
+                mv.visitExport(
+                        export.getNameAsString().replace('.', '/'),
+                        0,
+                        export.getModuleNames()
+                                .stream()
+                                .map(Name::toString)
+                                .toArray(String[]::new)
+               );
+            }
+
+            mv.visitRequire("java.base", ACC_MANDATED, null);
+            mv.visitEnd();
+
+            classWriter.visitEnd();
+
+            byte[] bytes = classWriter.toByteArray();
+
+
+            try (JarOutputStream targetStream = new JarOutputStream(new FileOutputStream(outputJar.toString()))) {
+                {
+                    JarEntry entry = new JarEntry("module-info.class");
+                    targetStream.putNextEntry(entry);
+                    targetStream.write(bytes);
+                    targetStream.closeEntry();
+                }
+
+                JarFile jarFile = new JarFile(inputJar.toString());
+                Iterator<JarEntry> iterator = jarFile.entries().asIterator();
+                while (iterator.hasNext()) {
+                    JarEntry entry = iterator.next();
+                    String name = entry.getName();
+
+                    if (name.endsWith("/")) {
+                        targetStream.putNextEntry(entry);
+                        targetStream.closeEntry();
+                    } else {
+                        targetStream.putNextEntry(entry);
+
+                        try (InputStream stream = jarFile.getInputStream(entry)) {
+                            stream.transferTo(targetStream);
+                        }
+
+                        targetStream.closeEntry();
+                    }
+                }
+            }
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
     }
 
     private static boolean exec(String[] cmdArray) throws IOException, InterruptedException {
