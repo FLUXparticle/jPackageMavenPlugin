@@ -187,33 +187,37 @@ public class BuildImage extends AbstractMojo {
     }
 
     private static String fix(Path modulesDir, String modulePath, Path jar) throws IOException, InterruptedException {
-        System.out.println("Fix: " + jar);
-
-        if (!jDeps(modulesDir, modulePath, jar)) {
-            return null;
-        }
-
         String fileName = jar.getFileName().toString();
-        int splitVersion = fileName.lastIndexOf('-');
-
-        String moduleName = fileName.substring(0, splitVersion).replace('-', '.');
-
-        Path mod = modulesDir.resolve(moduleName);
-        Path out = mod.resolve("classes");
-
-        extract(jar, out);
-
-        Path file = mod.resolve("module-info.java");
-
-        if (!javaCompiler(modulePath, out, file)) {
-            return null;
-        }
-
         Path target = modulesDir.resolve(fileName);
 
-        pack(target, out);
+        if (Files.exists(target)) {
+            System.out.println("Already Fixed: " + fileName);
+        } else try {
+            System.out.println("Fix: " + jar);
 
-        System.out.println();
+            if (!jDeps(modulesDir, modulePath, jar)) {
+                return null;
+            }
+
+            int splitVersion = fileName.lastIndexOf('-');
+
+            String moduleName = fileName.substring(0, splitVersion).replace('-', '.');
+
+            Path mod = modulesDir.resolve(moduleName);
+            Path out = mod.resolve("classes");
+
+            extract(jar, out);
+
+            Path file = mod.resolve("module-info.java");
+
+            if (!javaCompiler(modulePath, out, file)) {
+                return null;
+            }
+
+            pack(target, out);
+        } finally {
+            System.out.println();
+        }
 
         return target.toString();
     }
