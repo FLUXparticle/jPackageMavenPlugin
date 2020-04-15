@@ -6,7 +6,6 @@ import com.github.javaparser.ast.expr.Name;
 import com.github.javaparser.ast.modules.ModuleDeclaration;
 import com.github.javaparser.ast.modules.ModuleExportsDirective;
 import com.github.javaparser.ast.modules.ModuleRequiresDirective;
-import org.apache.maven.artifact.DependencyResolutionRequiredException;
 import org.apache.maven.execution.MavenSession;
 import org.apache.maven.plugin.AbstractMojo;
 import org.apache.maven.plugin.MojoExecutionException;
@@ -20,6 +19,11 @@ import org.apache.maven.plugins.annotations.ResolutionScope;
 import org.apache.maven.project.DefaultProjectBuildingRequest;
 import org.apache.maven.project.MavenProject;
 import org.apache.maven.project.ProjectBuildingRequest;
+import org.apache.maven.shared.artifact.filter.ScopeArtifactFilter;
+import org.apache.maven.shared.dependency.graph.DependencyGraphBuilder;
+import org.apache.maven.shared.dependency.graph.DependencyGraphBuilderException;
+import org.apache.maven.shared.dependency.graph.DependencyNode;
+import org.apache.maven.shared.dependency.graph.traversal.DependencyNodeVisitor;
 import org.apache.maven.shared.transfer.artifact.DefaultArtifactCoordinate;
 import org.apache.maven.shared.transfer.artifact.resolve.ArtifactResolver;
 import org.apache.maven.shared.transfer.artifact.resolve.ArtifactResolverException;
@@ -27,6 +31,7 @@ import org.apache.maven.shared.transfer.artifact.resolve.ArtifactResult;
 import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.ModuleVisitor;
 
+import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -36,23 +41,26 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
-import java.util.Arrays;
+import java.util.Deque;
 import java.util.Iterator;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
-import java.util.Scanner;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import java.util.jar.JarOutputStream;
 import java.util.jar.Manifest;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.IntStream;
+import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 
 import static com.github.javaparser.ParserConfiguration.LanguageLevel.JAVA_9;
 import static java.lang.String.join;
+import static java.util.Arrays.asList;
 import static java.util.function.Function.identity;
-import static java.util.stream.Collectors.joining;
 import static java.util.stream.Collectors.toList;
 import static java.util.stream.Collectors.toMap;
 import static org.objectweb.asm.Opcodes.ACC_MANDATED;
@@ -90,11 +98,17 @@ public class BuildImage extends AbstractMojo {
     @Component
     private ArtifactResolver artifactResolver;
 
+    @Component( hint = "default" )
+    private DependencyGraphBuilder dependencyGraphBuilder;
+
     @Parameter(defaultValue = "${project}", required = true)
     private MavenProject project;
 
     @Parameter(defaultValue = "${session}", required = true, readonly = true)
     private MavenSession session;
+
+    @Parameter( defaultValue = "${reactorProjects}", readonly = true, required = true )
+    private List<MavenProject> reactorProjects;
 
     @Parameter(property = "skip", readonly = true)
     private boolean skip;
@@ -125,7 +139,92 @@ public class BuildImage extends AbstractMojo {
             String target = project.getBuild().getDirectory();
             Path modulesDir = Path.of(target, "modules");
 
-            List<String> classpathElements = processJars(project.getRuntimeClasspathElements(), modulesDir);
+            ProjectBuildingRequest buildingRequest = new DefaultProjectBuildingRequest(session.getProjectBuildingRequest());
+            buildingRequest.setProject(project);
+
+            DependencyNode root = dependencyGraphBuilder.buildDependencyGraph(buildingRequest, new ScopeArtifactFilter("runtime"), reactorProjects);
+
+            List<List<String>> lines = new ArrayList<>();
+            lines.add(asList("classpathElements:", "modular:"));
+
+            List<String> result = new ArrayList<>();
+
+            root.accept(new DependencyNodeVisitor() {
+
+                final Deque<List<String>> stack = new LinkedList<>();
+
+                @Override
+                public boolean visit(DependencyNode dependencyNode) {
+//                    System.out.println(dependencyNode.getArtifact());
+                    File file = dependencyNode.getArtifact().getFile();
+                    stack.add(new ArrayList<>());
+//                    System.out.println("  ".repeat(stack.size()) + file);
+                    return true;
+                }
+
+                @Override
+                public boolean endVisit(DependencyNode dependencyNode) {
+                    try {
+                        List<String> classPathElements = stack.removeLast();
+
+                        File file = dependencyNode.getArtifact().getFile();
+
+                        if (file != null && file.toString().endsWith(".jar")) {
+                            Path path = file.toPath();
+                            String classpathElement = path.toString();
+                            String fileName = path.getFileName().toString();
+
+                            List<String> line = new ArrayList<>();
+                            line.add(fileName);
+
+                            String modular;
+                            if (isModular(classpathElement)) {
+                                result.add(classpathElement);
+                                modular = "yes";
+                            } else {
+                                String newElement = null;
+                                String action = null;
+
+                                if (fileName.startsWith("kotlin-stdlib-")) {
+                                    newElement = replaceKotlinStdLib(fileName);
+                                    action = "replaced";
+                                }
+
+                                if (fileName.startsWith("javafx-")) {
+                                    newElement = "";
+                                }
+
+                                if (newElement == null) {
+                                    String modulePath = String.join(":", classPathElements);
+                                    newElement = fix(modulesDir, modulePath, path);
+                                    action = "fixed";
+                                }
+
+                                if (newElement == null) {
+                                    modular = "no";
+                                } else if (newElement.isEmpty()) {
+                                    modular = "removed";
+                                } else {
+                                    result.add(newElement);
+                                    modular = action;
+                                }
+                            }
+                            line.add(modular);
+                            lines.add(line);
+
+                            List<String> last = stack.getLast();
+                            last.addAll(classPathElements);
+                            last.add(classpathElement);
+                        }
+
+                        return true;
+                    } catch (IOException | InterruptedException e) {
+                        throw new RuntimeException(e);
+                    }
+                }
+            });
+
+            printLines(lines);
 
             Path appDir = Path.of(target, name + ".app");
             if (Files.exists(appDir)) {
@@ -133,11 +232,11 @@ public class BuildImage extends AbstractMojo {
                 deleteDir(appDir);
             }
 
-            String modulePath = join(":", classpathElements);
+            String modulePath = join(":", result);
             if (!jPackage(name, version, modulePath, mainClass, target)) {
                 throw new MojoExecutionException("jpackage error");
             }
-        } catch (IOException | DependencyResolutionRequiredException | InterruptedException e) {
+        } catch (IOException | InterruptedException | DependencyGraphBuilderException e) {
             throw new MojoExecutionException(e.toString(), e);
         }
     }
@@ -145,61 +244,19 @@ public class BuildImage extends AbstractMojo {
     private List<String> processJars(List<String> classpathElements, Path modulesDir) throws IOException, InterruptedException {
         List<String> result = new ArrayList<>();
 
-        List<List<String>> lines = new ArrayList<>();
-        lines.add(Arrays.asList("classpathElements:", "modular:"));
-        for (int i = 0; i < classpathElements.size(); i++) {
-            String classpathElement = classpathElements.get(i);
+        for (String classpathElement : classpathElements) {
             Path path = Path.of(classpathElement);
             String fileName = path.getFileName().toString();
+
+/*
             if (!fileName.endsWith(".jar")) {
                 result.add(classpathElement);
                 continue;
             }
+*/
 
-            List<String> line = new ArrayList<>();
-            line.add(fileName);
 
-            String modular;
-            if (isModular(classpathElement)) {
-                result.add(classpathElement);
-                modular = "yes";
-            } else {
-                String newElement = null;
-                String action = null;
-
-                if (fileName.startsWith("kotlin-stdlib-")) {
-                    newElement = replaceKotlinStdLib(fileName);
-                    action = "replaced";
-                }
-
-                if (fileName.startsWith("javafx-")) {
-                    newElement = "";
-                }
-
-                if (newElement == null) {
-                    String modulePath = classpathElements.stream()
-                            .filter(p -> p.endsWith(".jar"))
-                            .filter(p -> !p.equals(path.toString()))
-                            .collect(joining(":"));
-                    newElement = fix(modulesDir, modulePath, path);
-                    action = "fixed";
-                }
-
-                if (newElement == null) {
-                    modular = "no";
-                } else if (newElement.isEmpty()) {
-                    modular = "removed";
-                } else {
-                    result.add(newElement);
-                    modular = action;
-                }
-            }
-            line.add(modular);
-
-            lines.add(line);
         }
-
-        printLines(lines);
 
         return result;
     }
@@ -213,13 +270,29 @@ public class BuildImage extends AbstractMojo {
         } else try {
             System.out.println("Fix: " + jar);
 
+            List<Path> deps = Stream.of(modulePath.split(":"))
+                    .map(Path::of)
+//                    .map(Path::getFileName)
+                    .collect(toList());
+            System.out.println("deps = " + deps);
+
             if (!jDeps(modulesDir, modulePath, jar)) {
                 return null;
             }
 
-            int splitVersion = fileName.lastIndexOf('-');
+            String moduleName = new JarFile(jar.toFile()).getManifest().getMainAttributes().getValue("Automatic-Module-Name");
 
-            String moduleName = fileName.substring(0, splitVersion).replace('-', '.');
+            if (moduleName == null) {
+                Pattern pattern = Pattern.compile("-(\\d+(\\.|$))");
+                Matcher matcher = pattern.matcher(fileName);
+                if (matcher.find()) {
+                    moduleName = fileName.substring(0, matcher.start());
+                } else {
+                    int splitExtension = fileName.lastIndexOf('.');
+                    moduleName = fileName.substring(0, splitExtension);
+                }
+                moduleName = moduleName.replace('-', '.');
+            }
 
             Path mod = modulesDir.resolve(moduleName);
             Path moduleInfo = mod.resolve("module-info.java");
@@ -301,12 +374,21 @@ public class BuildImage extends AbstractMojo {
 //        List<String> versions = getVersions(path.toString());
 
 //        if (versions.isEmpty()) {
-        String[] cmdArray = {
-                jDepsBinary.toString(),
-                "--generate-module-info", modulesDir.toString(),
-                "--module-path", modulePath,
-                path.toString(),
-        };
+
+
+
+        List<String> cmdArray = new ArrayList<>();
+
+        cmdArray.add(jDepsBinary.toString());
+        cmdArray.addAll(asList("--generate-module-info", modulesDir.toString()));
+
+        if (!modulePath.isEmpty()) {
+            cmdArray.addAll(asList("--module-path", modulePath));
+        }
+
+        cmdArray.add(path.toString());
+
+        System.out.println("cmdArray = " + cmdArray);
 
         return exec(cmdArray);
 //        } else for (String version : versions) {
@@ -324,7 +406,7 @@ public class BuildImage extends AbstractMojo {
 
     private String replaceKotlinStdLib(String fileName) {
         String element;
-        ProjectBuildingRequest buildingRequest = new DefaultProjectBuildingRequest(session.getProjectBuildingRequest());
+        ProjectBuildingRequest buildingRequest = session.getProjectBuildingRequest();
         DefaultArtifactCoordinate artifactCoordinate = toArtifactCoordinate(fileName);
         artifactCoordinate.setClassifier("modular");
         try {
@@ -405,7 +487,7 @@ public class BuildImage extends AbstractMojo {
 //                "--verbose",
         };
 
-        System.out.println(String.join(" ", cmdArray));
+        System.out.println(join(" ", cmdArray));
 
         return exec(cmdArray);
     }
@@ -498,28 +580,12 @@ public class BuildImage extends AbstractMojo {
         }
     }
 
+    private static boolean exec(List<String> cmdArray) throws IOException, InterruptedException {
+        return exec(cmdArray.toArray(String[]::new));
+    }
+
     private static boolean exec(String[] cmdArray) throws IOException, InterruptedException {
-        Process process = new ProcessBuilder(cmdArray).inheritIO().start();
-                // Runtime.getRuntime().exec(cmdArray);
-
-        try (Scanner sc = new Scanner(process.getInputStream())) {
-            while (sc.hasNextLine()) {
-                String line = sc.nextLine();
-                System.out.println(line);
-            }
-        }
-
-        if (process.waitFor() != 0) {
-            try (Scanner sc = new Scanner(process.getErrorStream())) {
-                while (sc.hasNextLine()) {
-                    String line = sc.nextLine();
-                    System.out.println(line);
-                }
-            }
-            return false;
-        }
-
-        return true;
+        return new ProcessBuilder(cmdArray).inheritIO().start().waitFor() == 0;
     }
 
     private DefaultArtifactCoordinate toArtifactCoordinate(String fileName) {
