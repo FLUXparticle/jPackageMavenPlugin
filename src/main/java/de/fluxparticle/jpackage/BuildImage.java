@@ -28,12 +28,13 @@ import org.apache.maven.shared.transfer.artifact.resolve.ArtifactResolverExcepti
 import org.apache.maven.shared.transfer.artifact.resolve.ArtifactResult;
 import org.eclipse.aether.DefaultRepositorySystemSession;
 import org.eclipse.aether.RepositorySystemSession;
+import org.eclipse.aether.artifact.Artifact;
+import org.eclipse.aether.graph.Dependency;
 import org.eclipse.aether.graph.DependencyNode;
 import org.eclipse.aether.graph.DependencyVisitor;
 import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.ModuleVisitor;
 
-import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -49,12 +50,17 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.SortedMap;
+import java.util.SortedSet;
+import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import java.util.jar.JarOutputStream;
 import java.util.jar.Manifest;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
@@ -122,6 +128,8 @@ public class BuildImage extends AbstractMojo {
     @Parameter(property = "mainClass", readonly = true)
     private String mainClass;
 
+    private SortedMap<String, SortedSet<String>> graph = new TreeMap<>();
+
     @Override
     public void execute() throws MojoExecutionException, MojoFailureException {
         if (skip) {
@@ -152,81 +160,106 @@ public class BuildImage extends AbstractMojo {
             List<List<String>> lines = new ArrayList<>();
             lines.add(asList("classpathElements:", "modular:"));
 
-            List<String> result = new ArrayList<>();
+            List<String> provided = new ArrayList<>();
 
             root.accept(new DependencyVisitor() {
 
-                final Deque<List<String>> stack = new LinkedList<>();
+                final Deque<String> stack = new LinkedList<>();
 
                 @Override
                 public boolean visitEnter(DependencyNode dependencyNode) {
-//                    System.out.println(dependencyNode.getArtifact());
-                    stack.add(new ArrayList<>());
-//                    System.out.println("  ".repeat(stack.size()) + file);
+                    Dependency dependency = dependencyNode.getDependency();
+                    if (dependency != null) {
+                        Artifact artifact = dependencyNode.getArtifact();
+                        System.out.println("  ".repeat(stack.size()) + artifact + " (" + dependency.getScope() + ")");
+                        switch (dependency.getScope()) {
+                            case "provided":
+                                provided.add(artifact.getFile().toString());
+                            case "test":
+                                return false;
+                        }
+                        if (artifact.getGroupId().equals("org.openjfx")) {
+                            provided.add(artifact.getFile().toString());
+                        }
+                        String parentFile = stack.peekLast();
+                        String artifactFile = artifact.getFile().toString();
+                        stack.addLast(artifactFile);
+                        graph.computeIfAbsent(artifactFile, key -> new TreeSet<>());
+                        if (parentFile != null) {
+                            graph.get(parentFile).add(artifactFile);
+                        }
+                    }
                     return true;
                 }
 
                 @Override
                 public boolean visitLeave(DependencyNode dependencyNode) {
-                    try {
-                        List<String> classPathElements = stack.removeLast();
-
-                        File file = dependencyNode.getArtifact().getFile();
-
-                        if (file != null && file.toString().endsWith(".jar")) {
-                            Path path = file.toPath();
-                            String classpathElement = path.toString();
-                            String fileName = path.getFileName().toString();
-
-                            List<String> line = new ArrayList<>();
-                            line.add(fileName);
-
-                            String modular;
-                            if (isModular(classpathElement)) {
-                                result.add(classpathElement);
-                                modular = "yes";
-                            } else {
-                                String newElement = null;
-                                String action = null;
-
-                                if (fileName.startsWith("kotlin-stdlib-")) {
-                                    newElement = replaceKotlinStdLib(fileName);
-                                    action = "replaced";
-                                }
-
-                                if (fileName.startsWith("javafx-")) {
-                                    newElement = "";
-                                }
-
-                                if (newElement == null) {
-                                    String modulePath = String.join(":", classPathElements);
-                                    newElement = fix(modulesDir, modulePath, path);
-                                    action = "fixed";
-                                }
-
-                                if (newElement == null) {
-                                    modular = "no";
-                                } else if (newElement.isEmpty()) {
-                                    modular = "removed";
-                                } else {
-                                    result.add(newElement);
-                                    modular = action;
-                                }
-                            }
-                            line.add(modular);
-                            lines.add(line);
-
-                            List<String> last = stack.getLast();
-                            last.addAll(classPathElements);
-                            last.add(classpathElement);
+                    Dependency dependency = dependencyNode.getDependency();
+                    if (dependency != null) {
+                        switch (dependency.getScope()) {
+                            case "provided":
+                            case "test":
+                                return true;
                         }
-
-                        return true;
-                    } catch (IOException | InterruptedException e) {
-                        throw new RuntimeException(e);
+                        stack.removeLast();
                     }
+                    return true;
                 }
             });
+
+
+            List<String> result = new ArrayList<>();
+
+            for (String artifactFile : graph.keySet()) {
+
+                try {
+                    if (artifactFile.endsWith(".jar")) {
+                        String fileName = artifactFile.substring(artifactFile.lastIndexOf('/') + 1);
+
+                        List<String> line = new ArrayList<>();
+                        line.add(fileName);
+
+                        String modular;
+                        if (isModular(artifactFile)) {
+                            result.add(artifactFile);
+                            modular = "yes";
+                        } else {
+                            String newElement = null;
+                            String action = null;
+
+                            if (fileName.startsWith("kotlin-stdlib-")) {
+                                newElement = replaceKotlinStdLib(fileName);
+                                action = "replaced";
+                            }
+
+                            if (fileName.startsWith("javafx-")) {
+                                newElement = "";
+                            }
+
+                            if (newElement == null) {
+                                String modulePath = Stream.concat(provided.stream(), dependencies(artifactFile))
+                                        .collect(Collectors.joining(":"));
+                                newElement = fix(modulesDir, modulePath, Path.of(artifactFile));
+                                action = "fixed";
+                            }
+
+                            if (newElement == null) {
+                                modular = "no";
+                            } else if (newElement.isEmpty()) {
+                                modular = "removed";
+                            } else {
+                                result.add(newElement);
+                                modular = action;
+                            }
+                        }
+                        line.add(modular);
+                        lines.add(line);
+                    }
+                } catch (RuntimeException | IOException | InterruptedException e) {
+                    throw new RuntimeException(e);
+                }
+            }
+
 
             printLines(lines);
 
@@ -243,6 +276,11 @@ public class BuildImage extends AbstractMojo {
         } catch (IOException | InterruptedException | DependencyResolutionException e) {
             throw new MojoExecutionException(e.toString(), e);
         }
+    }
+
+    private Stream<String> dependencies(String artifactID) {
+        return graph.get(artifactID).stream()
+                .flatMap(childID -> Stream.concat(Stream.of(childID), dependencies(childID)));
     }
 
     private static String fix(Path modulesDir, String modulePath, Path jar) throws IOException, InterruptedException {
