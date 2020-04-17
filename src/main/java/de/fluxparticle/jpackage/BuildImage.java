@@ -38,6 +38,9 @@ import org.objectweb.asm.ModuleVisitor;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.module.ModuleDescriptor;
+import java.lang.module.ModuleFinder;
+import java.lang.module.ModuleReference;
 import java.nio.file.FileVisitResult;
 import java.nio.file.FileVisitor;
 import java.nio.file.Files;
@@ -57,14 +60,11 @@ import java.util.TreeSet;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import java.util.jar.JarOutputStream;
-import java.util.jar.Manifest;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
-import java.util.zip.ZipEntry;
 
+import static com.github.fge.lambdas.Throwing.consumer;
+import static com.github.fge.lambdas.Throwing.predicate;
 import static com.github.javaparser.ParserConfiguration.LanguageLevel.JAVA_9;
 import static java.lang.String.join;
 import static java.util.Arrays.asList;
@@ -240,8 +240,8 @@ public class BuildImage extends AbstractMojo {
                             }
 
                             if (newElement == null) {
-                                String modulePath = Stream.concat(provided.stream(), dependencies(artifactFile))
-                                        .collect(Collectors.joining(":"));
+                                List<String> modulePath = Stream.concat(provided.stream(), dependencies(artifactFile))
+                                        .collect(toList());
                                 newElement = fix(modulesDir, modulePath, Path.of(artifactFile));
                                 action = "fixed";
                             }
@@ -286,7 +286,7 @@ public class BuildImage extends AbstractMojo {
                 .flatMap(childID -> Stream.concat(Stream.of(childID), dependencies(childID)));
     }
 
-    private static String fix(Path modulesDir, String modulePath, Path jar) throws IOException, InterruptedException {
+    private static String fix(Path modulesDir, List<String> modulePath, Path jar) throws IOException, InterruptedException {
         String fileName = jar.getFileName().toString();
         Path target = modulesDir.resolve(fileName);
 
@@ -295,34 +295,24 @@ public class BuildImage extends AbstractMojo {
         } else try {
             System.out.println("Fix: " + jar);
 
-            List<Path> deps = Stream.of(modulePath.split(":"))
-                    .map(Path::of)
-//                    .map(Path::getFileName)
-                    .collect(toList());
-            System.out.println("deps = " + deps);
+            SortedSet<Integer> versions = new TreeSet<>();
+            if (modulePath.stream().anyMatch(predicate(file -> new JarFile(file).isMultiRelease()))) {
+                modulePath.forEach(consumer((String file) -> versions.addAll(getVersions(file))));
+            }
 
-            if (!jDeps(modulesDir, modulePath, jar)) {
+            if (!jDeps(modulesDir, versions, modulePath, jar)) {
                 return null;
             }
 
-            String moduleName = new JarFile(jar.toFile()).getManifest().getMainAttributes().getValue("Automatic-Module-Name");
-
-            if (moduleName == null) {
-                Pattern pattern = Pattern.compile("-(\\d+(\\.|$))");
-                Matcher matcher = pattern.matcher(fileName);
-                if (matcher.find()) {
-                    moduleName = fileName.substring(0, matcher.start());
-                } else {
-                    int splitExtension = fileName.lastIndexOf('.');
-                    moduleName = fileName.substring(0, splitExtension);
-                }
-                moduleName = moduleName.replace('-', '.');
-            }
+            String moduleName = ModuleFinder.of(jar)
+                    .findAll().stream().findFirst()
+                    .map(ModuleReference::descriptor)
+                    .map(ModuleDescriptor::name)
+                    .get();
 
             Path mod = modulesDir.resolve(moduleName);
-            Path moduleInfo = mod.resolve("module-info.java");
 
-            patch(jar, moduleInfo, target);
+            patch(jar, mod, versions, target);
 
 /*
                 Path out = mod.resolve("classes");
@@ -393,39 +383,38 @@ public class BuildImage extends AbstractMojo {
         }
     }
 
-    private static boolean jDeps(Path modulesDir, String modulePath, Path path) throws IOException, InterruptedException {
+    private static boolean jDeps(Path modulesDir, SortedSet<Integer> versions, List<String> modulePath, Path path) throws IOException, InterruptedException {
         Path jDepsBinary = JAVA_HOME.resolve("bin/jdeps");
 
-//        List<String> versions = getVersions(path.toString());
+        if (versions.isEmpty()) {
+            List<String> cmdArray = new ArrayList<>();
 
-//        if (versions.isEmpty()) {
+            cmdArray.add(jDepsBinary.toString());
+            cmdArray.addAll(asList("--generate-module-info", modulesDir.toString()));
 
+            if (!modulePath.isEmpty()) {
+                cmdArray.addAll(asList("--module-path", String.join(":", modulePath)));
+            }
 
-        List<String> cmdArray = new ArrayList<>();
+            cmdArray.add(path.toString());
 
-        cmdArray.add(jDepsBinary.toString());
-        cmdArray.addAll(asList("--generate-module-info", modulesDir.toString()));
+            return exec(cmdArray);
+        } else return versions.stream().allMatch(predicate(version -> {
+            System.out.println("Version: " + version);
+            List<String> cmdArray = new ArrayList<>();
 
-        if (!modulePath.isEmpty()) {
-            cmdArray.addAll(asList("--module-path", modulePath));
-        }
+            cmdArray.add(jDepsBinary.toString());
+            cmdArray.addAll(asList("--generate-module-info", modulesDir.toString()));
+            cmdArray.addAll(asList("--multi-release", version.toString()));
 
-        cmdArray.add(path.toString());
+            if (!modulePath.isEmpty()) {
+                cmdArray.addAll(asList("--module-path", String.join(":", modulePath)));
+            }
 
-        System.out.println("cmdArray = " + cmdArray);
+            cmdArray.add(path.toString());
 
-        return exec(cmdArray);
-//        } else for (String version : versions) {
-//            String[] cmdArray = {
-//                    jDepsBinary.toString(),
-//                    "--multi-release", version,
-//                    "--generate-module-info", modulesDir.toString(),
-//                    "--module-path", modulePath,
-//                    path.toString(),
-//            };
-//
-//            exec(cmdArray);
-//        }
+            return exec(cmdArray);
+        }));
     }
 
     private String replaceKotlinStdLib(String fileName) {
@@ -532,51 +521,23 @@ public class BuildImage extends AbstractMojo {
         return exec(cmdArray);
     }
 
-    private static void patch(Path inputJar, Path moduleInfo, Path outputJar) {
-        System.out.println("Compile (In-Memory): " + moduleInfo);
+    private static void patch(Path inputJar, Path mod, SortedSet<Integer> versions, Path outputJar) {
 
         try {
-            CompilationUnit compilationUnit = StaticJavaParser.parse(moduleInfo);
-
-            ModuleDeclaration module = compilationUnit.getModule().get();
-
-            ClassWriter classWriter = new ClassWriter(0);
-            classWriter.visit(V9, ACC_MODULE, "module-info", null, null, null);
-
-            ModuleVisitor mv = classWriter.visitModule(module.getNameAsString(), ACC_SYNTHETIC, null);
-
-            for (ModuleRequiresDirective requires : module.findAll(ModuleRequiresDirective.class)) {
-                mv.visitRequire(
-                        requires.getName().asString(),
-                        0,
-                        null
-                );
-            }
-
-            for (ModuleExportsDirective export : module.findAll(ModuleExportsDirective.class)) {
-                mv.visitExport(
-                        export.getNameAsString().replace('.', '/'),
-                        0,
-                        export.getModuleNames()
-                                .stream()
-                                .map(Name::toString)
-                                .toArray(String[]::new)
-                );
-            }
-
-            mv.visitRequire("java.base", ACC_MANDATED, null);
-            mv.visitEnd();
-
-            classWriter.visitEnd();
-
-            byte[] bytes = classWriter.toByteArray();
-
 
             try (JarOutputStream targetStream = new JarOutputStream(new FileOutputStream(outputJar.toString()))) {
-                {
+                if (versions.isEmpty()) {
+                    Path moduleInfo = mod.resolve("module-info.java");
                     JarEntry entry = new JarEntry("module-info.class");
                     targetStream.putNextEntry(entry);
-                    targetStream.write(bytes);
+                    targetStream.write(compile(moduleInfo));
+                    targetStream.closeEntry();
+                } else for (Integer version : versions) {
+                    Path path = Path.of("versions", version.toString(), "module-info.java");
+                    Path moduleInfo = mod.resolve(path);
+                    JarEntry entry = new JarEntry(path.resolveSibling("module-info.class").toString());
+                    targetStream.putNextEntry(entry);
+                    targetStream.write(compile(moduleInfo));
                     targetStream.closeEntry();
                 }
 
@@ -603,6 +564,44 @@ public class BuildImage extends AbstractMojo {
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
+    }
+
+    private static byte[] compile(Path moduleInfo) throws IOException {
+        System.out.println("Compile (In-Memory): " + moduleInfo);
+        CompilationUnit compilationUnit = StaticJavaParser.parse(moduleInfo);
+
+        ModuleDeclaration module = compilationUnit.getModule().get();
+
+        ClassWriter classWriter = new ClassWriter(0);
+        classWriter.visit(V9, ACC_MODULE, "module-info", null, null, null);
+
+        ModuleVisitor mv = classWriter.visitModule(module.getNameAsString(), ACC_SYNTHETIC, null);
+
+        for (ModuleRequiresDirective requires : module.findAll(ModuleRequiresDirective.class)) {
+            mv.visitRequire(
+                    requires.getName().asString(),
+                    0,
+                    null
+            );
+        }
+
+        for (ModuleExportsDirective export : module.findAll(ModuleExportsDirective.class)) {
+            mv.visitExport(
+                    export.getNameAsString().replace('.', '/'),
+                    0,
+                    export.getModuleNames()
+                            .stream()
+                            .map(Name::toString)
+                            .toArray(String[]::new)
+            );
+        }
+
+        mv.visitRequire("java.base", ACC_MANDATED, null);
+        mv.visitEnd();
+
+        classWriter.visitEnd();
+
+        return classWriter.toByteArray();
     }
 
     private static boolean exec(List<String> cmdArray) throws IOException, InterruptedException {
@@ -632,17 +631,14 @@ public class BuildImage extends AbstractMojo {
                 .anyMatch(jarEntry -> jarEntry.getName().equals("module-info.class"));
     }
 
-    private static List<String> getVersions(String jar) throws IOException {
+    private static List<Integer> getVersions(String jar) throws IOException {
         JarFile jarFile = new JarFile(jar);
 
-        Manifest manifest = jarFile.getManifest();
-        System.out.println("manifest = " + manifest.getMainAttributes().keySet());
-
-        String prefixVersions = "META-INF/versions/";
+        Path prefixVersions = Path.of("META-INF/versions");
         return jarFile.stream()
-                .map(ZipEntry::toString)
-                .filter(s -> s.startsWith(prefixVersions))
-                .map(s -> s.substring(prefixVersions.length()))
+                .map(entry -> Path.of(entry.toString()))
+                .filter(p -> p.startsWith(prefixVersions) && p.getNameCount() == 3)
+                .map(p -> Integer.parseInt(p.getName(2).toString()))
                 .collect(toList());
     }
 
