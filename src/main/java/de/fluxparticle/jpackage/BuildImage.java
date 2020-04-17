@@ -160,7 +160,7 @@ public class BuildImage extends AbstractMojo {
             List<List<String>> lines = new ArrayList<>();
             lines.add(asList("classpathElements:", "modular:"));
 
-            List<String> provided = new ArrayList<>();
+            List<String> runtime = new ArrayList<>();
 
             root.accept(new DependencyVisitor() {
 
@@ -173,8 +173,8 @@ public class BuildImage extends AbstractMojo {
                         Artifact artifact = dependencyNode.getArtifact();
                         System.out.println("  ".repeat(stack.size()) + artifact + " (" + dependency.getScope() + ")");
                         switch (dependency.getScope()) {
-                            case "provided":
-                                provided.add(artifact.getFile().toString());
+                            case "runtime":
+                                runtime.add(artifact.getFile().toString());
                             case "test":
                                 return false;
                         }
@@ -182,7 +182,7 @@ public class BuildImage extends AbstractMojo {
                             case "org.openjfx":
                             case "javax.xml.bind":
                             case "com.sun.activation":
-                                provided.add(artifact.getFile().toString());
+                                runtime.add(artifact.getFile().toString());
                         }
                         String parentFile = stack.peekLast();
                         String artifactFile = artifact.getFile().toString();
@@ -200,7 +200,7 @@ public class BuildImage extends AbstractMojo {
                     Dependency dependency = dependencyNode.getDependency();
                     if (dependency != null) {
                         switch (dependency.getScope()) {
-                            case "provided":
+                            case "runtime":
                             case "test":
                                 return true;
                         }
@@ -240,7 +240,7 @@ public class BuildImage extends AbstractMojo {
                             }
 
                             if (newElement == null) {
-                                List<String> modulePath = Stream.concat(provided.stream(), dependencies(artifactFile))
+                                List<String> modulePath = Stream.concat(runtime.stream(), dependencies(artifactFile))
                                         .collect(toList());
                                 newElement = fix(modulesDir, modulePath, Path.of(artifactFile));
                                 action = "fixed";
