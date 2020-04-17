@@ -16,18 +16,20 @@ import org.apache.maven.plugins.annotations.LifecyclePhase;
 import org.apache.maven.plugins.annotations.Mojo;
 import org.apache.maven.plugins.annotations.Parameter;
 import org.apache.maven.plugins.annotations.ResolutionScope;
+import org.apache.maven.project.DefaultDependencyResolutionRequest;
 import org.apache.maven.project.DefaultProjectBuildingRequest;
+import org.apache.maven.project.DependencyResolutionException;
 import org.apache.maven.project.MavenProject;
 import org.apache.maven.project.ProjectBuildingRequest;
-import org.apache.maven.shared.artifact.filter.ScopeArtifactFilter;
-import org.apache.maven.shared.dependency.graph.DependencyGraphBuilder;
-import org.apache.maven.shared.dependency.graph.DependencyGraphBuilderException;
-import org.apache.maven.shared.dependency.graph.DependencyNode;
-import org.apache.maven.shared.dependency.graph.traversal.DependencyNodeVisitor;
+import org.apache.maven.project.ProjectDependenciesResolver;
 import org.apache.maven.shared.transfer.artifact.DefaultArtifactCoordinate;
 import org.apache.maven.shared.transfer.artifact.resolve.ArtifactResolver;
 import org.apache.maven.shared.transfer.artifact.resolve.ArtifactResolverException;
 import org.apache.maven.shared.transfer.artifact.resolve.ArtifactResult;
+import org.eclipse.aether.DefaultRepositorySystemSession;
+import org.eclipse.aether.RepositorySystemSession;
+import org.eclipse.aether.graph.DependencyNode;
+import org.eclipse.aether.graph.DependencyVisitor;
 import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.ModuleVisitor;
 
@@ -63,6 +65,7 @@ import static java.util.Arrays.asList;
 import static java.util.function.Function.identity;
 import static java.util.stream.Collectors.toList;
 import static java.util.stream.Collectors.toMap;
+import static org.eclipse.aether.util.graph.transformer.ConflictResolver.CONFIG_PROP_VERBOSE;
 import static org.objectweb.asm.Opcodes.ACC_MANDATED;
 import static org.objectweb.asm.Opcodes.ACC_MODULE;
 import static org.objectweb.asm.Opcodes.ACC_SYNTHETIC;
@@ -71,17 +74,17 @@ import static org.objectweb.asm.Opcodes.V9;
 /**
  * jPackageMavenPlugin - A Maven Plugin to patch all non-modular dependencies and runs jpackage (JDK 14)
  * Copyright (C) 2020  Sven Reinck
- *
+ * <p>
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, either version 3 of the License, or
  * (at your option) any later version.
- *
+ * <p>
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
- *
+ * <p>
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see https://www.gnu.org/licenses/gpl-3.0
  */
@@ -98,8 +101,8 @@ public class BuildImage extends AbstractMojo {
     @Component
     private ArtifactResolver artifactResolver;
 
-    @Component( hint = "default" )
-    private DependencyGraphBuilder dependencyGraphBuilder;
+    @Component(hint = "default")
+    private ProjectDependenciesResolver projectDependenciesResolver;
 
     @Parameter(defaultValue = "${project}", required = true)
     private MavenProject project;
@@ -107,7 +110,7 @@ public class BuildImage extends AbstractMojo {
     @Parameter(defaultValue = "${session}", required = true, readonly = true)
     private MavenSession session;
 
-    @Parameter( defaultValue = "${reactorProjects}", readonly = true, required = true )
+    @Parameter(defaultValue = "${reactorProjects}", readonly = true, required = true)
     private List<MavenProject> reactorProjects;
 
     @Parameter(property = "skip", readonly = true)
@@ -142,28 +145,29 @@ public class BuildImage extends AbstractMojo {
             ProjectBuildingRequest buildingRequest = new DefaultProjectBuildingRequest(session.getProjectBuildingRequest());
             buildingRequest.setProject(project);
 
-            DependencyNode root = dependencyGraphBuilder.buildDependencyGraph(buildingRequest, new ScopeArtifactFilter("runtime"), reactorProjects);
+            DefaultDependencyResolutionRequest resolutionRequest = new DefaultDependencyResolutionRequest(project, getVerboseRepositorySession(session.getRepositorySession()));
+
+            DependencyNode root = projectDependenciesResolver.resolve(resolutionRequest).getDependencyGraph();
 
             List<List<String>> lines = new ArrayList<>();
             lines.add(asList("classpathElements:", "modular:"));
 
             List<String> result = new ArrayList<>();
 
-            root.accept(new DependencyNodeVisitor() {
+            root.accept(new DependencyVisitor() {
 
                 final Deque<List<String>> stack = new LinkedList<>();
 
                 @Override
-                public boolean visit(DependencyNode dependencyNode) {
+                public boolean visitEnter(DependencyNode dependencyNode) {
 //                    System.out.println(dependencyNode.getArtifact());
-                    File file = dependencyNode.getArtifact().getFile();
                     stack.add(new ArrayList<>());
 //                    System.out.println("  ".repeat(stack.size()) + file);
                     return true;
                 }
 
                 @Override
-                public boolean endVisit(DependencyNode dependencyNode) {
+                public boolean visitLeave(DependencyNode dependencyNode) {
                     try {
                         List<String> classPathElements = stack.removeLast();
 
@@ -236,29 +240,9 @@ public class BuildImage extends AbstractMojo {
             if (!jPackage(name, version, modulePath, mainClass, target)) {
                 throw new MojoExecutionException("jpackage error");
             }
-        } catch (IOException | InterruptedException | DependencyGraphBuilderException e) {
+        } catch (IOException | InterruptedException | DependencyResolutionException e) {
             throw new MojoExecutionException(e.toString(), e);
         }
-    }
-
-    private List<String> processJars(List<String> classpathElements, Path modulesDir) throws IOException, InterruptedException {
-        List<String> result = new ArrayList<>();
-
-        for (String classpathElement : classpathElements) {
-            Path path = Path.of(classpathElement);
-            String fileName = path.getFileName().toString();
-
-/*
-            if (!fileName.endsWith(".jar")) {
-                result.add(classpathElement);
-                continue;
-            }
-*/
-
-
-        }
-
-        return result;
     }
 
     private static String fix(Path modulesDir, String modulePath, Path jar) throws IOException, InterruptedException {
@@ -376,7 +360,6 @@ public class BuildImage extends AbstractMojo {
 //        if (versions.isEmpty()) {
 
 
-
         List<String> cmdArray = new ArrayList<>();
 
         cmdArray.add(jDepsBinary.toString());
@@ -450,20 +433,21 @@ public class BuildImage extends AbstractMojo {
                         .collect(toMap(
                                 identity(),
                                 idx -> line.get(idx).length()
-                       ))
+                        ))
                         .entrySet().stream()
-               )
+                )
                 .collect(toMap(
                         Entry::getKey,
                         Entry::getValue,
                         Math::max
-               ));
+                ));
 
         for (List<String> line : lines) {
             StringBuilder sb = new StringBuilder();
             String delimiter = "";
             for (int i = 0; i < line.size(); i++) {
-                sb.append(delimiter); delimiter = "  ";
+                sb.append(delimiter);
+                delimiter = "  ";
 
                 String str = line.get(i);
                 sb.append(str);
@@ -525,7 +509,7 @@ public class BuildImage extends AbstractMojo {
                         requires.getName().asString(),
                         0,
                         null
-               );
+                );
             }
 
             for (ModuleExportsDirective export : module.findAll(ModuleExportsDirective.class)) {
@@ -536,7 +520,7 @@ public class BuildImage extends AbstractMojo {
                                 .stream()
                                 .map(Name::toString)
                                 .toArray(String[]::new)
-               );
+                );
             }
 
             mv.visitRequire("java.base", ACC_MANDATED, null);
@@ -619,6 +603,13 @@ public class BuildImage extends AbstractMojo {
                 .filter(s -> s.startsWith(prefixVersions))
                 .map(s -> s.substring(prefixVersions.length()))
                 .collect(toList());
+    }
+
+    private static RepositorySystemSession getVerboseRepositorySession(RepositorySystemSession repositorySession) {
+        DefaultRepositorySystemSession verboseRepositorySession = new DefaultRepositorySystemSession(repositorySession);
+        verboseRepositorySession.setConfigProperty(CONFIG_PROP_VERBOSE, "true");
+//        verboseRepositorySession.setReadOnly();
+        return verboseRepositorySession;
     }
 
 }
