@@ -182,6 +182,7 @@ public class BuildImage extends AbstractMojo {
                             case "org.openjfx":
                             case "javax.xml.bind":
                             case "com.sun.activation":
+                            case "com.sun.xml.bind":
                                 runtime.add(artifact.getFile().toString());
                         }
                         String parentFile = stack.peekLast();
