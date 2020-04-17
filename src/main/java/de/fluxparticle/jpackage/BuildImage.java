@@ -178,8 +178,11 @@ public class BuildImage extends AbstractMojo {
                             case "test":
                                 return false;
                         }
-                        if (artifact.getGroupId().equals("org.openjfx")) {
-                            provided.add(artifact.getFile().toString());
+                        switch (artifact.getGroupId()) {
+                            case "org.openjfx":
+                            case "javax.xml.bind":
+                            case "com.sun.activation":
+                                provided.add(artifact.getFile().toString());
                         }
                         String parentFile = stack.peekLast();
                         String artifactFile = artifact.getFile().toString();
