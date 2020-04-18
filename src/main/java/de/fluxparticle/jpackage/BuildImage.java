@@ -5,7 +5,9 @@ import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.expr.Name;
 import com.github.javaparser.ast.modules.ModuleDeclaration;
 import com.github.javaparser.ast.modules.ModuleExportsDirective;
+import com.github.javaparser.ast.modules.ModuleProvidesDirective;
 import com.github.javaparser.ast.modules.ModuleRequiresDirective;
+import com.github.javaparser.ast.modules.ModuleUsesDirective;
 import org.apache.maven.execution.MavenSession;
 import org.apache.maven.plugin.AbstractMojo;
 import org.apache.maven.plugin.MojoExecutionException;
@@ -329,22 +331,24 @@ public class BuildImage extends AbstractMojo {
         } else try {
             System.out.println("Fix: " + jar);
 
-            SortedSet<Integer> versions = new TreeSet<>();
-            if (modulePath.stream().anyMatch(predicate(file -> new JarFile(file).isMultiRelease()))) {
-                modulePath.forEach(consumer((String file) -> versions.addAll(getVersions(file))));
-            }
-
-            if (!jDeps(modulesDir, versions, modulePath, jar)) {
-                return null;
-            }
-
             String moduleName = ModuleFinder.of(jar)
                     .findAll().stream().findFirst()
                     .map(ModuleReference::descriptor)
                     .map(ModuleDescriptor::name)
                     .get();
 
+            SortedSet<Integer> versions = new TreeSet<>();
+            if (modulePath.stream().anyMatch(predicate(file -> new JarFile(file).isMultiRelease()))) {
+                modulePath.forEach(consumer((String file) -> versions.addAll(getVersions(file))));
+            }
+
             Path mod = modulesDir.resolve(moduleName);
+
+            if (!Files.exists(mod)) {
+                if (!jDeps(modulesDir, versions, modulePath, jar)) {
+                    return null;
+                }
+            }
 
             patch(jar, mod, versions, target);
 
@@ -646,7 +650,7 @@ public class BuildImage extends AbstractMojo {
 
         for (ModuleExportsDirective export : module.findAll(ModuleExportsDirective.class)) {
             mv.visitExport(
-                    export.getNameAsString().replace('.', '/'),
+                    getNameForBinary(export.getName()),
                     0,
                     export.getModuleNames()
                             .stream()
@@ -655,12 +659,30 @@ public class BuildImage extends AbstractMojo {
             );
         }
 
+        for (ModuleProvidesDirective provides : module.findAll(ModuleProvidesDirective.class)) {
+            mv.visitProvide(
+                    getNameForBinary(provides.getName()),
+                    provides.getWith()
+                            .stream()
+                            .map(BuildImage::getNameForBinary)
+                            .toArray(String[]::new)
+            );
+        }
+
+        for (ModuleUsesDirective uses : module.findAll(ModuleUsesDirective.class)) {
+            mv.visitUse(getNameForBinary(uses.getName()));
+        }
+
         mv.visitRequire("java.base", ACC_MANDATED, null);
         mv.visitEnd();
 
         classWriter.visitEnd();
 
         return classWriter.toByteArray();
+    }
+
+    private static String getNameForBinary(Name name) {
+        return name.toString().replace('.', '/');
     }
 
     private static boolean exec(List<String> cmdArray) throws IOException, InterruptedException {
