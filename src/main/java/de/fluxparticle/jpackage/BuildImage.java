@@ -134,6 +134,9 @@ public class BuildImage extends AbstractMojo {
     @Parameter(property = "mainClass", readonly = true)
     private String mainClass;
 
+    @Parameter(property = "verbose", readonly = true)
+    private boolean verbose;
+
     private SortedMap<String, SortedSet<String>> graph = new TreeMap<>();
 
     @Override
@@ -520,19 +523,22 @@ public class BuildImage extends AbstractMojo {
         }
     }
 
-    private static boolean jPackage(String name, String version, String modulePath, String mainClass, String target) throws IOException, InterruptedException {
+    private boolean jPackage(String name, String version, String modulePath, String mainClass, String target) throws IOException, InterruptedException {
         Path jPackageBinary = JAVA_HOME.resolve("bin/jpackage");
 
-        String[] cmdArray = {
-                jPackageBinary.toString(),
-                "--type", "app-image",
-                "--name", name,
-                "--app-version", version,
-                "--module-path", modulePath,
-                "--module", mainClass,
-                "--dest", target,
-//                "--verbose",
-        };
+        List<String> cmdArray = new ArrayList<>();
+
+        cmdArray.add(jPackageBinary.toString());
+        cmdArray.addAll(asList("--type", "app-image"));
+        cmdArray.addAll(asList("--name", name));
+        cmdArray.addAll(asList("--app-version", version));
+        cmdArray.addAll(asList("--module-path", modulePath));
+        cmdArray.addAll(asList("--module", mainClass));
+        cmdArray.addAll(asList("--dest", target));
+
+        if (verbose) {
+            cmdArray.add("--verbose");
+        }
 
         System.out.println(join(" ", cmdArray));
 
