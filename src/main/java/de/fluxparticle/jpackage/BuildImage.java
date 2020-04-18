@@ -48,18 +48,23 @@ import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Deque;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Set;
 import java.util.SortedMap;
 import java.util.SortedSet;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.jar.Attributes;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import java.util.jar.JarOutputStream;
+import java.util.jar.Manifest;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
@@ -68,6 +73,7 @@ import static com.github.fge.lambdas.Throwing.predicate;
 import static com.github.javaparser.ParserConfiguration.LanguageLevel.JAVA_9;
 import static java.lang.String.join;
 import static java.util.Arrays.asList;
+import static java.util.Collections.singleton;
 import static java.util.function.Function.identity;
 import static java.util.stream.Collectors.toList;
 import static java.util.stream.Collectors.toMap;
@@ -160,7 +166,7 @@ public class BuildImage extends AbstractMojo {
             List<List<String>> lines = new ArrayList<>();
             lines.add(asList("classpathElements:", "modular:"));
 
-            List<String> runtime = new ArrayList<>();
+            Map<String, Set<String>> scopes = new HashMap<>();
 
             root.accept(new DependencyVisitor() {
 
@@ -171,22 +177,24 @@ public class BuildImage extends AbstractMojo {
                     Dependency dependency = dependencyNode.getDependency();
                     if (dependency != null) {
                         Artifact artifact = dependencyNode.getArtifact();
+                        String parentFile = stack.peekLast();
+                        String artifactFile = artifact.getFile().toString();
                         System.out.println("  ".repeat(stack.size()) + artifact + " (" + dependency.getScope() + ")");
                         switch (dependency.getScope()) {
+                            case "compile":
                             case "runtime":
-                                runtime.add(artifact.getFile().toString());
+                                scopes.computeIfAbsent(artifactFile, key -> new HashSet<>()).add(dependency.getScope());
+                                break;
                             case "test":
                                 return false;
                         }
                         switch (artifact.getGroupId()) {
                             case "org.openjfx":
                             case "javax.xml.bind":
-                            case "com.sun.activation":
+//                            case "com.sun.activation":
                             case "com.sun.xml.bind":
-                                runtime.add(artifact.getFile().toString());
+                                scopes.computeIfAbsent(artifactFile, key -> new HashSet<>()).add("runtime");
                         }
-                        String parentFile = stack.peekLast();
-                        String artifactFile = artifact.getFile().toString();
                         stack.addLast(artifactFile);
                         graph.computeIfAbsent(artifactFile, key -> new TreeSet<>());
                         if (parentFile != null) {
@@ -201,7 +209,7 @@ public class BuildImage extends AbstractMojo {
                     Dependency dependency = dependencyNode.getDependency();
                     if (dependency != null) {
                         switch (dependency.getScope()) {
-                            case "runtime":
+//                            case "runtime":
                             case "test":
                                 return true;
                         }
@@ -211,11 +219,23 @@ public class BuildImage extends AbstractMojo {
                 }
             });
 
+            Stream<String> runtimeA = scopes.entrySet().stream()
+                    .filter(entry -> entry.getValue().equals(singleton("runtime")))
+                    .map(Entry::getKey);
+
+            Stream<String> runtimeB = graph.keySet().stream()
+                    .filter(artifactFile -> artifactFile.endsWith(".jar"))
+                    .filter(predicate(BuildImage::isModular));
+
+            List<String> runtime = Stream.concat(runtimeA, runtimeB)
+                    .collect(toList());
+
+            System.out.println("Runtime:");
+            runtime.forEach(System.out::println);
 
             List<String> result = new ArrayList<>();
 
             for (String artifactFile : graph.keySet()) {
-
                 try {
                     if (artifactFile.endsWith(".jar")) {
                         String fileName = artifactFile.substring(artifactFile.lastIndexOf('/') + 1);
@@ -241,8 +261,12 @@ public class BuildImage extends AbstractMojo {
                             }
 
                             if (newElement == null) {
-                                List<String> modulePath = Stream.concat(runtime.stream(), dependencies(artifactFile))
-                                        .collect(toList());
+                                List<String> modulePath = ((fileName.startsWith("javax.activation-api")) ? dependencies(artifactFile) :
+                                        /*(runtime.contains(artifactFile))
+                                        ? dependencies(artifactFile)
+                                        : */Stream.concat(runtime.stream(), dependencies(artifactFile))
+                                ).collect(toList());
+
                                 newElement = fix(modulesDir, modulePath, Path.of(artifactFile));
                                 action = "fixed";
                             }
@@ -258,12 +282,15 @@ public class BuildImage extends AbstractMojo {
                         }
                         line.add(modular);
                         lines.add(line);
+                    } else {
+                        result.add(artifactFile);
                     }
                 } catch (RuntimeException | IOException | InterruptedException e) {
                     throw new RuntimeException(e);
                 }
             }
 
+            result.add(project.getBuild().getOutputDirectory());
 
             printLines(lines);
 
@@ -272,6 +299,9 @@ public class BuildImage extends AbstractMojo {
                 System.out.println("Deleting: " + appDir);
                 deleteDir(appDir);
             }
+
+            System.out.println("Result:");
+            result.forEach(System.out::println);
 
             String modulePath = join(":", result);
             if (!jPackage(name, version, modulePath, mainClass, target)) {
@@ -392,6 +422,7 @@ public class BuildImage extends AbstractMojo {
 
             cmdArray.add(jDepsBinary.toString());
             cmdArray.addAll(asList("--generate-module-info", modulesDir.toString()));
+//            cmdArray.add("--ignore-missing-deps");
 
             if (!modulePath.isEmpty()) {
                 cmdArray.addAll(asList("--module-path", String.join(":", modulePath)));
@@ -406,6 +437,7 @@ public class BuildImage extends AbstractMojo {
 
             cmdArray.add(jDepsBinary.toString());
             cmdArray.addAll(asList("--generate-module-info", modulesDir.toString()));
+            cmdArray.add("--ignore-missing-deps");
             cmdArray.addAll(asList("--multi-release", version.toString()));
 
             if (!modulePath.isEmpty()) {
@@ -536,7 +568,7 @@ public class BuildImage extends AbstractMojo {
                 } else for (Integer version : versions) {
                     Path path = Path.of("versions", version.toString(), "module-info.java");
                     Path moduleInfo = mod.resolve(path);
-                    JarEntry entry = new JarEntry(path.resolveSibling("module-info.class").toString());
+                    JarEntry entry = new JarEntry(Path.of("META-INF").resolve(path.resolveSibling("module-info.class")).toString());
                     targetStream.putNextEntry(entry);
                     targetStream.write(compile(moduleInfo));
                     targetStream.closeEntry();
@@ -550,6 +582,26 @@ public class BuildImage extends AbstractMojo {
 
                     if (name.endsWith("/")) {
                         targetStream.putNextEntry(entry);
+                        targetStream.closeEntry();
+                    } else if (name.equals("META-INF/MANIFEST.MF")) {
+                        JarEntry newEntry = new JarEntry(name);
+                        targetStream.putNextEntry(newEntry);
+
+                        try (InputStream stream = jarFile.getInputStream(entry)) {
+                            Manifest manifest = new Manifest(stream);
+
+                            Attributes mainAttributes = manifest.getMainAttributes();
+                            mainAttributes.remove("Automatic-Module-Name");
+                            if (!versions.isEmpty()) {
+                                mainAttributes.putValue("Multi-Release", "true");
+                            }
+
+                            System.out.println("Manifest:");
+                            mainAttributes.entrySet().forEach(System.out::println);
+
+                            manifest.write(targetStream);
+                        }
+
                         targetStream.closeEntry();
                     } else {
                         targetStream.putNextEntry(entry);
