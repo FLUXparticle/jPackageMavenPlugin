@@ -37,6 +37,7 @@ import org.eclipse.aether.graph.DependencyVisitor;
 import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.ModuleVisitor;
 
+import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -308,7 +309,7 @@ public class BuildImage extends AbstractMojo {
             System.out.println("Result:");
             result.forEach(System.out::println);
 
-            String modulePath = join(":", result);
+            String modulePath = join(File.pathSeparator, result);
             if (!jPackage(name, version, modulePath, mainClass, target)) {
                 throw new MojoExecutionException("jpackage error");
             }
@@ -432,7 +433,7 @@ public class BuildImage extends AbstractMojo {
 //            cmdArray.add("--ignore-missing-deps");
 
             if (!modulePath.isEmpty()) {
-                cmdArray.addAll(asList("--module-path", String.join(":", modulePath)));
+                cmdArray.addAll(asList("--module-path", String.join(File.pathSeparator, modulePath)));
             }
 
             cmdArray.add(path.toString());
@@ -448,7 +449,7 @@ public class BuildImage extends AbstractMojo {
             cmdArray.addAll(asList("--multi-release", version.toString()));
 
             if (!modulePath.isEmpty()) {
-                cmdArray.addAll(asList("--module-path", String.join(":", modulePath)));
+                cmdArray.addAll(asList("--module-path", String.join(File.pathSeparator, modulePath)));
             }
 
             cmdArray.add(path.toString());
