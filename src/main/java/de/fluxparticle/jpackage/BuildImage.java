@@ -133,7 +133,7 @@ public class BuildImage extends AbstractMojo {
                 deleteDir(appDir);
             }
 
-            String modulePath = join(":", classpathElements);
+            String modulePath = join(";", classpathElements);
             if (!jPackage(name, version, modulePath, mainClass, target)) {
                 throw new MojoExecutionException("jpackage error");
             }
@@ -180,7 +180,7 @@ public class BuildImage extends AbstractMojo {
                     String modulePath = classpathElements.stream()
                             .filter(p -> p.endsWith(".jar"))
                             .filter(p -> !p.equals(path.toString()))
-                            .collect(joining(":"));
+                            .collect(joining(";"));
                     newElement = fix(modulesDir, modulePath, path);
                     action = "fixed";
                 }
