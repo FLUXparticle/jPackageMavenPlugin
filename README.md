@@ -1,3 +1,5 @@
+
+
 # jPackageMavenPlugin
 This Maven Plugin patches all non-modular dependencies of your project and runs jpackage (JDK 14) to build a platform specific Runtime Image
 
@@ -26,4 +28,5 @@ To use it just add this to your `pom.xml`:
 You can build a Runtime Image with:
 
     mvn jpackage:image
-    
+
+You can skip the goal with `-Dskip=true`.
